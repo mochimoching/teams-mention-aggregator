@@ -19,18 +19,23 @@ DEFAULT_LOG_DIR = Path(os.environ.get("APPDATA", ".")) / "teams-mention-agent"
 
 def setup_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    file_handler = RotatingFileHandler(
         log_dir / "agent.log",
         maxBytes=2 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
     )
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(fmt)
+
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    root.addHandler(handler)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
 
 
 def install_startup() -> None:
