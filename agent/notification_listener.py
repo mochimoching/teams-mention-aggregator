@@ -1,22 +1,32 @@
-"""Windows notification listener using WinRT UserNotificationListener."""
+"""Windows notification listener using the WPN notification database (SQLite).
+
+Instead of the WinRT UserNotificationListener API (which requires packaged-app
+privileges), this module reads the Windows Push Notification database directly.
+The database is located at:
+  %LOCALAPPDATA%\\Microsoft\\Windows\\Notifications\\wpndatabase.db
+"""
 
 import logging
+import os
+import shutil
+import sqlite3
+import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-
-from winrt.windows.ui.notifications.management import UserNotificationListener
-from winrt.windows.ui.notifications import (
-    NotificationKinds,
-    UserNotificationChangedKind,
-)
 
 logger = logging.getLogger(__name__)
 
-# Known Teams App IDs
-TEAMS_APP_IDS = {
-    "MSTeams_8wekyb3d8bbwe!MSTeams",     # New Teams (MSIX)
-    "com.squirrel.Teams.Teams",            # Classic Teams
-    "Microsoft.Teams",                     # Alternative ID
+# Known Teams handler PrimaryIds in NotificationHandler table
+TEAMS_PRIMARY_IDS = {
+    "MSTeams_8wekyb3d8bbwe!MSTeams",       # New Teams (MSIX)
+    "com.squirrel.Teams.Teams",             # Classic Teams
+    "Microsoft.Teams",                      # Alternative ID
 }
+
+WPN_DB_PATH = os.path.join(
+    os.environ.get("LOCALAPPDATA", ""),
+    "Microsoft", "Windows", "Notifications", "wpndatabase.db",
+)
 
 
 @dataclass
@@ -29,53 +39,111 @@ class TeamsNotification:
 
 class NotificationListener:
     def __init__(self):
-        self._listener = UserNotificationListener.current
         self._seen_ids: set[int] = set()
+        self._teams_handler_ids: set[int] = set()
         self._initialized = False
 
     async def request_access(self) -> bool:
-        """Request notification access. Returns True if granted."""
-        access = await self._listener.request_access_async()
-        # 0 = Allowed, 1 = Denied, 2 = Unspecified
-        granted = access == 0
-        if granted:
-            logger.info("Notification access granted")
+        """Verify the notification database is accessible and find Teams handler IDs."""
+        if not os.path.exists(WPN_DB_PATH):
+            logger.error("Notification database not found: %s", WPN_DB_PATH)
+            return False
+
+        try:
+            conn = self._open_db()
+            cur = conn.cursor()
+            rows = cur.execute(
+                "SELECT RecordId, PrimaryId FROM NotificationHandler"
+            ).fetchall()
+            conn.close()
+            self._cleanup_tmp()
+
+            for record_id, primary_id in rows:
+                if any(tid in (primary_id or "") for tid in TEAMS_PRIMARY_IDS):
+                    self._teams_handler_ids.add(record_id)
+                    logger.info("Found Teams handler: %s (id=%d)", primary_id, record_id)
+
+            if not self._teams_handler_ids:
+                logger.warning(
+                    "No Teams notification handlers found in DB. "
+                    "Teams notifications will not be detected until Teams is installed/run."
+                )
             self._initialized = True
-        else:
-            logger.error("Notification access denied (status=%d)", access)
-        return granted
+            logger.info("Notification database access OK (%d Teams handlers)", len(self._teams_handler_ids))
+            return True
+
+        except Exception as e:
+            logger.error("Failed to access notification database: %s", e)
+            return False
+
+    @staticmethod
+    def _tmp_path() -> str:
+        return os.path.join(tempfile.gettempdir(), "wpn_agent_copy.db")
+
+    def _open_db(self) -> sqlite3.Connection:
+        """Open a read-only copy of the WPN database.
+
+        The database is locked by the system, so we copy it to a temp file first.
+        """
+        tmp = self._tmp_path()
+        shutil.copy2(WPN_DB_PATH, tmp)
+        conn = sqlite3.connect(tmp)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _cleanup_tmp(self) -> None:
+        try:
+            os.remove(self._tmp_path())
+        except OSError:
+            pass
 
     async def get_new_teams_notifications(self) -> list[TeamsNotification]:
-        """Poll for new Teams toast notifications."""
+        """Poll for new Teams toast notifications from the database."""
         if not self._initialized:
             return []
 
         results: list[TeamsNotification] = []
         try:
-            notifications = await self._listener.get_notifications_async(
-                NotificationKinds.TOAST
-            )
+            conn = self._open_db()
+            cur = conn.cursor()
+
+            # Re-discover Teams handler IDs in case Teams was installed after startup
+            if not self._teams_handler_ids:
+                rows = cur.execute(
+                    "SELECT RecordId, PrimaryId FROM NotificationHandler"
+                ).fetchall()
+                for record_id, primary_id in rows:
+                    if any(tid in (primary_id or "") for tid in TEAMS_PRIMARY_IDS):
+                        self._teams_handler_ids.add(record_id)
+                        logger.info("Discovered Teams handler: %s (id=%d)", primary_id, record_id)
+
+            if not self._teams_handler_ids:
+                conn.close()
+                self._cleanup_tmp()
+                return []
+
+            placeholders = ",".join("?" for _ in self._teams_handler_ids)
+            toasts = cur.execute(
+                f"SELECT Id, Payload FROM Notification "
+                f"WHERE Type = 'toast' AND HandlerId IN ({placeholders}) "
+                f"ORDER BY ArrivalTime DESC",
+                list(self._teams_handler_ids),
+            ).fetchall()
+            conn.close()
+            self._cleanup_tmp()
+
         except Exception as e:
-            logger.error("Failed to get notifications: %s", e)
+            logger.error("Failed to read notification database: %s", e)
+            self._cleanup_tmp()
             return []
 
-        for notif in notifications:
-            nid = notif.id
-            if nid in self._seen_ids:
+        for notif_id, payload in toasts:
+            if notif_id in self._seen_ids:
                 continue
 
-            self._seen_ids.add(nid)
+            self._seen_ids.add(notif_id)
 
-            try:
-                app_info = notif.app_info
-                app_id = app_info.app_user_model_id if app_info else ""
-            except Exception:
-                app_id = ""
-
-            if not any(teams_id in app_id for teams_id in TEAMS_APP_IDS):
-                continue
-
-            sender, channel, message = self._extract_text(notif)
+            sender, channel, message = self._extract_text(payload)
             if not message:
                 continue
 
@@ -84,32 +152,34 @@ class NotificationListener:
                     sender=sender,
                     channel=channel,
                     message=message,
-                    notification_id=nid,
+                    notification_id=notif_id,
                 )
             )
             logger.debug("New Teams notification: %s / %s: %s", sender, channel, message)
 
         # Prevent seen_ids from growing unbounded
         if len(self._seen_ids) > 10000:
-            current_ids = {n.id for n in notifications} if notifications else set()
+            current_ids = {t[0] for t in toasts} if toasts else set()
             self._seen_ids = current_ids
 
         return results
 
-    def _extract_text(self, notif) -> tuple[str, str, str]:
-        """Extract sender, channel, message from toast notification binding."""
+    def _extract_text(self, payload) -> tuple[str, str, str]:
+        """Extract sender, channel, message from toast notification XML payload."""
         try:
-            toast_binding = notif.notification.visual.get_binding(
-                "ToastGeneric"
-            ) or notif.notification.visual.bindings[0]
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8", errors="replace")
 
-            texts = [
-                el.text
-                for el in toast_binding.get_text_elements()
-                if hasattr(el, "text") and el.text
-            ]
+            root = ET.fromstring(payload)
+
+            texts = []
+            for text_el in root.iter("text"):
+                t = text_el.text
+                if t:
+                    texts.append(t.strip())
+
         except Exception as e:
-            logger.debug("Failed to extract toast text: %s", e)
+            logger.debug("Failed to parse toast XML: %s", e)
             return ("", "", "")
 
         # Typical Teams toast layout:
@@ -125,16 +195,16 @@ class NotificationListener:
         return ("", "", "")
 
     async def discover_apps(self) -> list[str]:
-        """List all app IDs from current notifications (debug helper)."""
-        notifications = await self._listener.get_notifications_async(
-            NotificationKinds.TOAST
-        )
-        app_ids = set()
-        for notif in notifications:
-            try:
-                app_info = notif.app_info
-                app_id = app_info.app_user_model_id if app_info else "(unknown)"
-                app_ids.add(app_id)
-            except Exception:
-                app_ids.add("(error)")
-        return sorted(app_ids)
+        """List all app IDs from notification handlers (debug helper)."""
+        try:
+            conn = self._open_db()
+            cur = conn.cursor()
+            handlers = cur.execute(
+                "SELECT PrimaryId FROM NotificationHandler ORDER BY PrimaryId"
+            ).fetchall()
+            conn.close()
+            self._cleanup_tmp()
+            return [h[0] for h in handlers if h[0]]
+        except Exception as e:
+            logger.error("Failed to discover apps: %s", e)
+            return []
