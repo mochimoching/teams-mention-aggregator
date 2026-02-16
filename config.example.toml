@@ -1,0 +1,20 @@
+[relay]
+url = "https://your-worker.your-subdomain.workers.dev"
+api_key = "change-me-to-a-secure-random-string"
+
+# Agent専用設定
+[agent]
+pc_name = "PC-A"          # この端末の識別名
+poll_interval = 3          # 通知ポーリング間隔 (秒)
+log_dir = ""               # 空ならデフォルト (%APPDATA%/teams-mention-agent/)
+
+# Collector専用設定
+[collector]
+poll_interval = 10         # リレーサーバポーリング間隔 (秒)
+notify_sound = true        # 新着時にサウンドを鳴らす
+notify_toast = true        # 新着時にトースト通知を表示
+
+# プロキシ設定 (必要な場合のみ)
+[proxy]
+# http = "http://proxy.example.com:8080"
+# https = "http://proxy.example.com:8080"

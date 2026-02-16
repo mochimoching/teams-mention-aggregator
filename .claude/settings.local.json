@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(dir /b \"C:\\\\mytk\\\\git\\\\randd\\\\teams_mention_to_email\")"
+    ]
+  }
+}
