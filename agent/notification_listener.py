@@ -3,8 +3,8 @@
 import logging
 from dataclasses import dataclass
 
-from winsdk.windows.ui.notifications.management import UserNotificationListener
-from winsdk.windows.ui.notifications import (
+from winrt.windows.ui.notifications.management import UserNotificationListener
+from winrt.windows.ui.notifications import (
     NotificationKinds,
     UserNotificationChangedKind,
 )
